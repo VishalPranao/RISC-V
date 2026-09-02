@@ -1,0 +1,57 @@
+module rv32_regfile (
+    input  logic        clk,
+    input  logic        reset,
+
+    input  logic [4:0]  rs1_addr,
+    output logic [31:0] rs1_data,
+
+    input  logic [4:0]  rs2_addr,
+    output logic [31:0] rs2_data,
+
+    input  logic        rd_write_enable,
+    input  logic [4:0]  rd_addr,
+    input  logic [31:0] rd_data
+);
+
+logic [31:0] registers [31:0];
+
+integer i;
+
+//sync register writes only 1 port 
+
+always_ff @(posedge clk)begin
+    if(reset) begin
+        for(i=0; i<32; i++)begin
+            registers[i] <= 32'b0;
+        end
+    end
+
+    else begin
+        registers[0] <= 32'b0;   // x0 must be always 0
+
+        if(rd_write_enable && (rd_addr != 5'd0)) begin
+            registers[rd_addr] <= rd_data;
+        end
+    end
+end
+
+
+//Async read port 1
+
+always_comb begin
+    if(rs1_addr == 5'd0)
+        rs1_data = 32'b0;
+    else
+        rs1_data = registers[rs1_addr];
+end
+
+//Asyns read port 2 
+
+always_comb begin
+        if (rs2_addr == 5'd0)
+            rs2_data = 32'b0;
+        else
+            rs2_data = registers[rs2_addr];
+    end
+
+endmodule

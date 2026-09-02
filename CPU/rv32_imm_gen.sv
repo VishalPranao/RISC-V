@@ -1,0 +1,65 @@
+module rv32_imm_gen
+    import rv32_pkg::*;
+(
+    input  logic [31:0] instruction,
+    input  imm_type_e   imm_type,
+    output logic [31:0] immediate
+);
+
+    always_comb begin
+        immediate = 32'b0;
+
+        case (imm_type)
+            IMM_I: begin
+                // Extract and sign-extend I-type immediate
+                immediate = {
+                    {20{instruction[31]}},
+                    instruction[31:20]
+                };
+            end
+
+            IMM_S: begin
+                // Combine the two S-type immediate fields
+                 immediate = {
+                    {20{instruction[31]}},
+                    instruction[31:25],
+                    instruction[11:7]
+                };
+            end
+
+            IMM_B: begin
+                // Reassemble B-type immediate fields
+                immediate = {
+                    {19{instruction[31]}},
+                    instruction[31],
+                    instruction[7],
+                    instruction[30:25],
+                    instruction[11:8],
+                    1'b0
+                };
+            end
+
+            IMM_U: begin
+                // Upper 20 bits followed by 12 zeros
+                immediate = {
+                    instruction[31:12],
+                    12'b0
+                };
+            end
+
+            IMM_J: begin
+                // Reassemble J-type immediate fields
+                immediate = {
+                    {11{instruction[31]}},
+                    instruction[31],
+                    instruction[19:12],
+                    instruction[20],
+                    instruction[30:21]
+                };
+            end
+
+            default: immediate = 32'b0;
+        endcase
+    end
+
+endmodule
