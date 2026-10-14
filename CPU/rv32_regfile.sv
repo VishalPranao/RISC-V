@@ -41,6 +41,8 @@ end
 always_comb begin
     if(rs1_addr == 5'd0)
         rs1_data = 32'b0;
+    else if (rd_write_enable && (rd_addr == rs1_addr))
+        rs1_data = rd_data; // WB-to-ID bypass on a same-cycle write/read
     else
         rs1_data = registers[rs1_addr];
 end
@@ -50,6 +52,8 @@ end
 always_comb begin
         if (rs2_addr == 5'd0)
             rs2_data = 32'b0;
+        else if (rd_write_enable && (rd_addr == rs2_addr))
+            rs2_data = rd_data;
         else
             rs2_data = registers[rs2_addr];
     end

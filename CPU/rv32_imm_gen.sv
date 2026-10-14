@@ -54,7 +54,8 @@ module rv32_imm_gen
                     instruction[31],
                     instruction[19:12],
                     instruction[20],
-                    instruction[30:21]
+                    instruction[30:21],
+                    1'b0
                 };
             end
 

@@ -229,6 +229,13 @@ module rv32_pipeline_core (
     logic [31:0] ex_operand_a;
     logic [31:0] ex_operand_b;
     logic [31:0] ex_alu_result;
+    logic [31:0] ex_result;
+    logic        m_is_div;
+    logic        m_div_start;
+    logic        m_div_busy;
+    logic        m_div_done;
+    logic        m_div_wait;
+    logic [31:0] m_div_result;
 
     logic        ex_branch_taken;
     logic        ex_redirect;
@@ -266,6 +273,37 @@ module rv32_pipeline_core (
         .operand_b(ex_operand_b),
         .alu_op   (id_ex_q.control.alu_op),
         .result   (ex_alu_result)
+    );
+
+    assign m_is_div =
+        (id_ex_q.control.alu_op == ALU_DIV) ||
+        (id_ex_q.control.alu_op == ALU_DIVU) ||
+        (id_ex_q.control.alu_op == ALU_REM) ||
+        (id_ex_q.control.alu_op == ALU_REMU);
+
+    // A DIV/REM stays in EX until done. Both operands are forwarded before
+    // the divider captures them, including a producer in EX/MEM or MEM/WB.
+    assign m_div_start = id_ex_q.valid && m_is_div && !m_div_busy && !m_div_done;
+    assign m_div_wait = id_ex_q.valid && m_is_div && !m_div_done;
+    assign ex_result = m_is_div ? m_div_result : ex_alu_result;
+
+    rv32_m_divider divider (
+        .clk(clk),
+        .reset(reset),
+        .start(m_div_start),
+        .dividend(ex_rs1_forwarded),
+        .divisor(ex_rs2_forwarded),
+        .signed_operation(
+            (id_ex_q.control.alu_op == ALU_DIV) ||
+            (id_ex_q.control.alu_op == ALU_REM)
+        ),
+        .want_remainder(
+            (id_ex_q.control.alu_op == ALU_REM) ||
+            (id_ex_q.control.alu_op == ALU_REMU)
+        ),
+        .busy(m_div_busy),
+        .done(m_div_done),
+        .result(m_div_result)
     );
 
     /*
@@ -403,7 +441,7 @@ module rv32_pipeline_core (
             if (ex_redirect) begin
                 fetch_pc <= ex_redirect_target;
             end
-            else if (!pc_stall) begin
+            else if (!pc_stall && !m_div_wait) begin
                 fetch_pc <= fetch_pc + 32'd4;
             end
 
@@ -413,7 +451,7 @@ module rv32_pipeline_core (
             if (if_id_flush) begin
                 if_id_q <= '0;
             end
-            else if (!if_id_stall) begin
+            else if (!if_id_stall && !m_div_wait) begin
                 if_id_q.valid       <= 1'b1;
                 if_id_q.pc          <= fetch_pc;
                 if_id_q.instruction <= instr_rdata;
@@ -425,7 +463,7 @@ module rv32_pipeline_core (
             if (id_ex_flush) begin
                 id_ex_q <= '0;
             end
-            else begin
+            else if (!m_div_wait) begin
                 id_ex_q.valid <=
                     if_id_q.valid &&
                     !id_illegal_instruction;
@@ -447,12 +485,19 @@ module rv32_pipeline_core (
              * The branch instruction itself is allowed to continue.
              * Only the younger instructions in IF and ID are flushed.
              */
-            ex_mem_q.valid       <= id_ex_q.valid;
-            ex_mem_q.alu_result  <= ex_alu_result;
-            ex_mem_q.store_data  <= ex_rs2_forwarded;
-            ex_mem_q.pc_plus_4   <= id_ex_q.pc_plus_4;
-            ex_mem_q.rd          <= id_ex_q.rd;
-            ex_mem_q.control     <= id_ex_q.control;
+            if (m_div_wait) begin
+                // Drain older MEM/WB entries while retaining the DIV in EX.
+                // The bubble prevents duplicated writes on every wait cycle.
+                ex_mem_q <= '0;
+            end
+            else begin
+                ex_mem_q.valid       <= id_ex_q.valid;
+                ex_mem_q.alu_result  <= ex_result;
+                ex_mem_q.store_data  <= ex_rs2_forwarded;
+                ex_mem_q.pc_plus_4   <= id_ex_q.pc_plus_4;
+                ex_mem_q.rd          <= id_ex_q.rd;
+                ex_mem_q.control     <= id_ex_q.control;
+            end
 
             /*
              * ---------------- MEM/WB register ----------------

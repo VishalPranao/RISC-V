@@ -202,6 +202,21 @@ module rv32_decoder (
                 control.operand_b_sel = OP_B_RS2;
                 control.wb_sel        = WB_ALU;
 
+                // M shares the OP opcode and uses funct7 = 0000001.
+                // Existing I operations retain their original decode below.
+                if (funct7 == 7'b0000001) begin
+                    case (funct3)
+                        3'b000: control.alu_op = ALU_MUL;
+                        3'b001: control.alu_op = ALU_MULH;
+                        3'b010: control.alu_op = ALU_MULHSU;
+                        3'b011: control.alu_op = ALU_MULHU;
+                        3'b100: control.alu_op = ALU_DIV;
+                        3'b101: control.alu_op = ALU_DIVU;
+                        3'b110: control.alu_op = ALU_REM;
+                        3'b111: control.alu_op = ALU_REMU;
+                    endcase
+                end
+                else begin
                 case (funct3)
                     3'b000: begin
                         case (funct7)
@@ -273,6 +288,7 @@ module rv32_decoder (
 
                     default: illegal_instruction = 1'b1;
                 endcase
+                end
             end
 
             default: begin

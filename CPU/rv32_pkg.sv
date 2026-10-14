@@ -19,7 +19,7 @@ package rv32_pkg;
         IMM_J
     } imm_type_e;
 
-    typedef enum logic [3:0] {
+    typedef enum logic [4:0] {
         ALU_ADD,
         ALU_SUB,
         ALU_SLL,
@@ -31,7 +31,15 @@ package rv32_pkg;
         ALU_OR,
         ALU_AND,
         ALU_PASS_A,
-        ALU_PASS_B
+        ALU_PASS_B,
+        ALU_MUL,
+        ALU_MULH,
+        ALU_MULHSU,
+        ALU_MULHU,
+        ALU_DIV,
+        ALU_DIVU,
+        ALU_REM,
+        ALU_REMU
     } alu_op_e;
 
     typedef enum logic [2:0] {
