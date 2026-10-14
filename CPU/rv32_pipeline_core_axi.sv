@@ -1,0 +1,580 @@
+// In-order RV32IM core with one outstanding instruction fetch and one
+// outstanding data transaction. Responses may take any number of cycles.
+module rv32_pipeline_core_axi (
+    input  logic        clk,
+    input  logic        reset,
+
+    output logic        i_req_valid,
+    input  logic        i_req_ready,
+    output logic [31:0] i_req_addr,
+    input  logic        i_resp_valid,
+    input  logic [31:0] i_resp_data,
+    input  logic        i_resp_error,
+
+    output logic        d_req_valid,
+    input  logic        d_req_ready,
+    output logic        d_req_write,
+    output logic [31:0] d_req_addr,
+    output logic [31:0] d_req_wdata,
+    output logic [3:0]  d_req_wstrb,
+    input  logic        d_resp_valid,
+    input  logic [31:0] d_resp_data,
+    input  logic        d_resp_error,
+    output logic        bus_error
+);
+
+    import rv32_pkg::*;
+
+    /*
+     * ================================================================
+     * Pipeline-register definitions
+     * ================================================================
+     */
+
+    typedef struct packed {
+        logic        valid;
+        logic [31:0] pc;
+        logic [31:0] instruction;
+    } if_id_pipe_t;
+
+    typedef struct packed {
+        logic        valid;
+        logic [31:0] pc;
+        logic [31:0] pc_plus_4;
+
+        logic [31:0] rs1_data;
+        logic [31:0] rs2_data;
+        logic [31:0] immediate;
+
+        logic [4:0]  rs1;
+        logic [4:0]  rs2;
+        logic [4:0]  rd;
+
+        control_t    control;
+    } id_ex_pipe_t;
+
+    typedef struct packed {
+        logic        valid;
+        logic [31:0] alu_result;
+        logic [31:0] store_data;
+        logic [31:0] pc_plus_4;
+        logic [4:0]  rd;
+        control_t    control;
+    } ex_mem_pipe_t;
+
+    typedef struct packed {
+        logic        valid;
+        logic [31:0] alu_result;
+        logic [31:0] load_data;
+        logic [31:0] pc_plus_4;
+        logic [4:0]  rd;
+        control_t    control;
+    } mem_wb_pipe_t;
+
+    if_id_pipe_t  if_id_q;
+    id_ex_pipe_t  id_ex_q;
+    ex_mem_pipe_t ex_mem_q;
+    mem_wb_pipe_t mem_wb_q;
+
+    /*
+     * ================================================================
+     * IF stage
+     * ================================================================
+     */
+
+    logic [31:0] fetch_pc;
+    logic [31:0] fetched_pc_q, pending_pc_q;
+    logic [31:0] fetched_inst_q;
+    logic fetched_valid_q, fetch_pending_q, fetch_kill_q;
+    logic mem_hold, mem_complete, mem_transaction;
+    logic mem_accepted_q;
+
+    logic pc_stall;
+    logic if_id_stall;
+    logic if_id_flush;
+    logic id_ex_flush;
+
+    // One slot holds the returned instruction until IF/ID can accept it.
+    // A redirect kills that slot and marks any outstanding response stale.
+    assign i_req_valid = !bus_error && !fetch_pending_q &&
+                         !fetched_valid_q && !ex_redirect;
+    assign i_req_addr = fetch_pc;
+
+    /*
+     * ================================================================
+     * ID stage
+     * ================================================================
+     */
+
+    logic [4:0] id_rs1;
+    logic [4:0] id_rs2;
+    logic [4:0] id_rd;
+
+    logic [31:0] id_rs1_data;
+    logic [31:0] id_rs2_data;
+    logic [31:0] id_immediate;
+
+    control_t id_control;
+    logic     id_illegal_instruction;
+
+    rv32_decoder decoder (
+    .instruction         (if_id_q.instruction),
+    .rs1_addr            (id_rs1),
+    .rs2_addr            (id_rs2),
+    .rd_addr             (id_rd),
+    .control             (id_control),
+    .illegal_instruction (id_illegal_instruction)
+);
+
+    rv32_imm_gen immediate_generator (
+        .instruction(if_id_q.instruction),
+        .imm_type   (id_control.imm_type),
+        .immediate  (id_immediate)
+    );
+
+    /*
+     * ================================================================
+     * WB stage
+     * ================================================================
+     *
+     * This appears before the register-file instance because the
+     * register file's write port uses these signals.
+     */
+
+    logic [31:0] wb_data;
+    logic        wb_write_enable;
+
+    always_comb begin
+        case (mem_wb_q.control.wb_sel)
+            WB_ALU:
+                wb_data = mem_wb_q.alu_result;
+
+            WB_MEMORY:
+                wb_data = mem_wb_q.load_data;
+
+            WB_PC_PLUS_4:
+                wb_data = mem_wb_q.pc_plus_4;
+
+            default:
+                wb_data = 32'b0;
+        endcase
+    end
+
+    assign wb_write_enable =
+        mem_wb_q.valid &&
+        mem_wb_q.control.reg_write;
+
+    rv32_regfile register_file (
+        .clk            (clk),
+        .reset          (reset),
+
+        .rs1_addr       (id_rs1),
+        .rs1_data       (id_rs1_data),
+
+        .rs2_addr       (id_rs2),
+        .rs2_data       (id_rs2_data),
+
+        .rd_write_enable(wb_write_enable),
+        .rd_addr        (mem_wb_q.rd),
+        .rd_data        (wb_data)
+    );
+
+    /*
+     * ================================================================
+     * Forwarding logic
+     * ================================================================
+     */
+
+    logic [1:0] forward_a;
+    logic [1:0] forward_b;
+
+    logic [31:0] ex_mem_forward_data;
+    logic [31:0] ex_rs1_forwarded;
+    logic [31:0] ex_rs2_forwarded;
+
+    /*
+     * Most EX/MEM instructions forward their ALU result.
+     * JAL/JALR must forward PC+4 because that is written into rd.
+     */
+    always_comb begin
+        case (ex_mem_q.control.wb_sel)
+            WB_PC_PLUS_4:
+                ex_mem_forward_data = ex_mem_q.pc_plus_4;
+
+            default:
+                ex_mem_forward_data = ex_mem_q.alu_result;
+        endcase
+    end
+
+    rv32_forwarding_unit forwarding_unit (
+        .id_ex_uses_rs1  (id_ex_q.control.uses_rs1),
+        .id_ex_uses_rs2  (id_ex_q.control.uses_rs2),
+        .id_ex_rs1       (id_ex_q.rs1),
+        .id_ex_rs2       (id_ex_q.rs2),
+
+        .ex_mem_valid    (ex_mem_q.valid),
+        .ex_mem_reg_write(ex_mem_q.control.reg_write),
+        .ex_mem_mem_read (ex_mem_q.control.mem_read),
+        .ex_mem_rd       (ex_mem_q.rd),
+
+        .mem_wb_valid    (mem_wb_q.valid),
+        .mem_wb_reg_write(mem_wb_q.control.reg_write),
+        .mem_wb_rd       (mem_wb_q.rd),
+
+        .forward_a       (forward_a),
+        .forward_b       (forward_b)
+    );
+
+    always_comb begin
+        case (forward_a)
+            2'b10:   ex_rs1_forwarded = ex_mem_forward_data;
+            2'b01:   ex_rs1_forwarded = wb_data;
+            default: ex_rs1_forwarded = id_ex_q.rs1_data;
+        endcase
+
+        case (forward_b)
+            2'b10:   ex_rs2_forwarded = ex_mem_forward_data;
+            2'b01:   ex_rs2_forwarded = wb_data;
+            default: ex_rs2_forwarded = id_ex_q.rs2_data;
+        endcase
+    end
+
+    /*
+     * ================================================================
+     * EX stage
+     * ================================================================
+     */
+
+    logic [31:0] ex_operand_a;
+    logic [31:0] ex_operand_b;
+    logic [31:0] ex_alu_result;
+    logic [31:0] ex_result;
+    logic        m_is_div;
+    logic        m_div_start;
+    logic        m_div_busy;
+    logic        m_div_done;
+    logic        m_div_wait;
+    logic [31:0] m_div_result;
+
+    logic        ex_branch_taken;
+    logic        ex_redirect;
+    logic [31:0] ex_redirect_target;
+
+    always_comb begin
+        case (id_ex_q.control.operand_a_sel)
+            OP_A_RS1:
+                ex_operand_a = ex_rs1_forwarded;
+
+            OP_A_PC:
+                ex_operand_a = id_ex_q.pc;
+
+            OP_A_ZERO:
+                ex_operand_a = 32'b0;
+
+            default:
+                ex_operand_a = 32'b0;
+        endcase
+
+        case (id_ex_q.control.operand_b_sel)
+            OP_B_RS2:
+                ex_operand_b = ex_rs2_forwarded;
+
+            OP_B_IMM:
+                ex_operand_b = id_ex_q.immediate;
+
+            default:
+                ex_operand_b = 32'b0;
+        endcase
+    end
+
+    rv32_alu alu (
+        .operand_a(ex_operand_a),
+        .operand_b(ex_operand_b),
+        .alu_op   (id_ex_q.control.alu_op),
+        .result   (ex_alu_result)
+    );
+
+    assign m_is_div =
+        (id_ex_q.control.alu_op == ALU_DIV) ||
+        (id_ex_q.control.alu_op == ALU_DIVU) ||
+        (id_ex_q.control.alu_op == ALU_REM) ||
+        (id_ex_q.control.alu_op == ALU_REMU);
+
+    // A DIV/REM stays in EX until done. Both operands are forwarded before
+    // the divider captures them, including a producer in EX/MEM or MEM/WB.
+    // A preceding MEM operation must retire before a divider can start:
+    // the divider's one-cycle done pulse can then always be consumed.
+    assign m_div_start = id_ex_q.valid && m_is_div && !m_div_busy &&
+                         !m_div_done && !mem_transaction;
+    assign m_div_wait = id_ex_q.valid && m_is_div && !m_div_done;
+    assign ex_result = m_is_div ? m_div_result : ex_alu_result;
+
+    rv32_m_divider divider (
+        .clk(clk),
+        .reset(reset),
+        .start(m_div_start),
+        .dividend(ex_rs1_forwarded),
+        .divisor(ex_rs2_forwarded),
+        .signed_operation(
+            (id_ex_q.control.alu_op == ALU_DIV) ||
+            (id_ex_q.control.alu_op == ALU_REM)
+        ),
+        .want_remainder(
+            (id_ex_q.control.alu_op == ALU_REM) ||
+            (id_ex_q.control.alu_op == ALU_REMU)
+        ),
+        .busy(m_div_busy),
+        .done(m_div_done),
+        .result(m_div_result)
+    );
+
+    /*
+     * Branch comparison uses the actual rs1 and rs2 values.
+     * It does not use the general ALU operand-selection results.
+     */
+    rv32_branch_cmp branch_comparator (
+        .operand_a   (ex_rs1_forwarded),
+        .operand_b   (ex_rs2_forwarded),
+        .branch_type (id_ex_q.control.branch_type),
+        .branch_taken(ex_branch_taken)
+    );
+
+    always_comb begin
+        /*
+         * Branch and JAL:
+         *     target = instruction PC + immediate
+         *
+         * JALR:
+         *     target = rs1 + immediate, with bit zero cleared
+         */
+        if (id_ex_q.control.is_jalr) begin
+            ex_redirect_target =
+                (ex_rs1_forwarded + id_ex_q.immediate)
+                & 32'hFFFF_FFFE;
+        end
+        else begin
+            ex_redirect_target =
+                id_ex_q.pc + id_ex_q.immediate;
+        end
+
+        ex_redirect =
+            id_ex_q.valid && !mem_hold &&
+            (
+                id_ex_q.control.is_jal ||
+                id_ex_q.control.is_jalr ||
+                ex_branch_taken
+            );
+    end
+
+    /*
+     * ================================================================
+     * Hazard detection
+     * ================================================================
+     */
+
+    rv32_hazard_unit hazard_unit (
+        .if_id_valid  (if_id_q.valid),
+        .id_uses_rs1  (id_control.uses_rs1),
+        .id_uses_rs2  (id_control.uses_rs2),
+        .id_rs1       (id_rs1),
+        .id_rs2       (id_rs2),
+
+        .id_ex_valid  (id_ex_q.valid),
+        .id_ex_mem_read(id_ex_q.control.mem_read),
+        .id_ex_rd     (id_ex_q.rd),
+
+        .ex_redirect  (ex_redirect),
+
+        .pc_stall     (pc_stall),
+        .if_id_stall  (if_id_stall),
+        .if_id_flush  (if_id_flush),
+        .id_ex_flush  (id_ex_flush)
+    );
+
+    /*
+     * ================================================================
+     * MEM stage
+     * ================================================================
+     */
+
+    logic [31:0] mem_load_data;
+    logic        mem_misaligned;
+    logic        lsu_write_enable;
+    logic        memory_fault;
+    logic data_read_enable;
+    logic [31:0] lsu_addr, lsu_wdata;
+    logic [3:0] lsu_wstrb;
+
+    rv32_lsu lsu (
+        .address            (ex_mem_q.alu_result),
+        .store_data         (ex_mem_q.store_data),
+        .memory_read_data   (d_resp_data),
+        .memory_read_enable(data_read_enable),
+
+        .mem_read           (
+            ex_mem_q.valid &&
+            ex_mem_q.control.mem_read
+        ),
+
+        .mem_write          (
+            ex_mem_q.valid &&
+            ex_mem_q.control.mem_write
+        ),
+
+        .mem_size           (ex_mem_q.control.mem_size),
+        .load_unsigned      (ex_mem_q.control.load_unsigned),
+
+        .memory_address     (lsu_addr),
+        .memory_write_data  (lsu_wdata),
+        .memory_write_strobe(lsu_wstrb),
+        .memory_write_enable(lsu_write_enable),
+
+        .load_data          (mem_load_data),
+        .misaligned_access(mem_misaligned)
+    );
+
+    assign d_req_addr  = {lsu_addr[31:2], 2'b00};
+    assign d_req_wdata = lsu_wdata;
+    assign d_req_wstrb = lsu_wstrb;
+    assign d_req_write = lsu_write_enable;
+    assign mem_transaction = ex_mem_q.valid &&
+        (ex_mem_q.control.mem_read || ex_mem_q.control.mem_write) &&
+        !mem_misaligned;
+    assign d_req_valid = mem_transaction && !mem_accepted_q;
+    assign mem_complete = mem_transaction && mem_accepted_q && d_resp_valid;
+    assign mem_hold = mem_transaction && !mem_complete;
+
+    assign memory_fault =
+        ex_mem_q.valid &&
+        (
+            ex_mem_q.control.mem_read ||
+            ex_mem_q.control.mem_write
+        ) &&
+        mem_misaligned;
+
+    /*
+     * ================================================================
+     * Sequential pipeline-register updates
+     * ================================================================
+     */
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            fetch_pc <= 32'b0;
+            fetched_pc_q <= '0;
+            pending_pc_q <= '0;
+            fetched_inst_q <= '0;
+            fetched_valid_q <= 1'b0;
+            fetch_pending_q <= 1'b0;
+            fetch_kill_q <= 1'b0;
+            mem_accepted_q <= 1'b0;
+            bus_error <= 1'b0;
+
+            if_id_q  <= '0;
+            id_ex_q  <= '0;
+            ex_mem_q <= '0;
+            mem_wb_q <= '0;
+        end
+        else begin
+            // Memory response ownership belongs to the instruction in MEM.
+            if (d_req_valid && d_req_ready) mem_accepted_q <= 1'b1;
+            if (!mem_transaction || mem_complete) mem_accepted_q <= 1'b0;
+            if (mem_complete && d_resp_error) bus_error <= 1'b1;
+
+            if (i_req_valid && i_req_ready) begin
+                fetch_pending_q <= 1'b1;
+                pending_pc_q <= fetch_pc;
+            end
+            if (i_resp_valid && fetch_pending_q) begin
+                fetch_pending_q <= 1'b0;
+                fetch_kill_q <= 1'b0;
+                if (!fetch_kill_q && !ex_redirect) begin
+                    fetched_pc_q <= pending_pc_q;
+                    fetched_inst_q <= i_resp_data;
+                    fetched_valid_q <= !i_resp_error;
+                    if (i_resp_error) bus_error <= 1'b1;
+                end
+            end
+            if (ex_redirect) begin
+                fetch_pc <= ex_redirect_target;
+                fetched_valid_q <= 1'b0;
+                if (fetch_pending_q && !i_resp_valid) fetch_kill_q <= 1'b1;
+            end
+            else if (!mem_hold && !pc_stall && !m_div_wait && fetched_valid_q) begin
+                fetch_pc <= fetch_pc + 32'd4;
+                fetched_valid_q <= 1'b0;
+            end
+
+            /*
+             * ---------------- IF/ID register ----------------
+             */
+            if (if_id_flush) begin
+                if_id_q <= '0;
+            end
+            else if (!mem_hold && !if_id_stall && !m_div_wait) begin
+                if_id_q.valid       <= fetched_valid_q;
+                if_id_q.pc          <= fetched_pc_q;
+                if_id_q.instruction <= fetched_inst_q;
+            end
+
+            /*
+             * ---------------- ID/EX register ----------------
+             */
+            if (!mem_hold && id_ex_flush) begin
+                id_ex_q <= '0;
+            end
+            else if (!mem_hold && !m_div_wait) begin
+                id_ex_q.valid <=
+                    if_id_q.valid &&
+                    !id_illegal_instruction;
+
+                id_ex_q.pc         <= if_id_q.pc;
+                id_ex_q.pc_plus_4  <= if_id_q.pc + 32'd4;
+                id_ex_q.rs1_data   <= id_rs1_data;
+                id_ex_q.rs2_data   <= id_rs2_data;
+                id_ex_q.immediate  <= id_immediate;
+                id_ex_q.rs1        <= id_rs1;
+                id_ex_q.rs2        <= id_rs2;
+                id_ex_q.rd         <= id_rd;
+                id_ex_q.control    <= id_control;
+            end
+
+            /*
+             * ---------------- EX/MEM register ----------------
+             *
+             * The branch instruction itself is allowed to continue.
+             * Only the younger instructions in IF and ID are flushed.
+             */
+            if (mem_hold) begin
+                // Keep the instruction and its request ownership in MEM.
+            end
+            else if (m_div_wait) begin
+                // Drain older MEM/WB entries while retaining the DIV in EX.
+                // The bubble prevents duplicated writes on every wait cycle.
+                ex_mem_q <= '0;
+            end
+            else begin
+                ex_mem_q.valid       <= id_ex_q.valid;
+                ex_mem_q.alu_result  <= ex_result;
+                ex_mem_q.store_data  <= ex_rs2_forwarded;
+                ex_mem_q.pc_plus_4   <= id_ex_q.pc_plus_4;
+                ex_mem_q.rd          <= id_ex_q.rd;
+                ex_mem_q.control     <= id_ex_q.control;
+            end
+
+            /*
+             * ---------------- MEM/WB register ----------------
+             */
+            mem_wb_q.valid       <= ex_mem_q.valid && !mem_hold &&
+                                    !memory_fault &&
+                                    !(mem_transaction && d_resp_error);
+
+            mem_wb_q.alu_result  <= ex_mem_q.alu_result;
+            mem_wb_q.load_data   <= mem_load_data;
+            mem_wb_q.pc_plus_4   <= ex_mem_q.pc_plus_4;
+            mem_wb_q.rd          <= ex_mem_q.rd;
+            mem_wb_q.control     <= ex_mem_q.control;
+        end
+    end
+
+endmodule
